@@ -2,7 +2,22 @@
 scripts to prepare LVM logical volumes and device partitions for use in ceph-volume
   * buildLVM.sh   <-- builds the configuration
   * destroyLVM.sh <-- teardown the configuration
-  
+
+```
+Section from /usr/share/ceph-ansible/group_vars/osds
+osd_scenario: lvm
+lvm_volumes:
+  cached-lv0: /dev/nvme0n1p5
+  cached-lv1: /dev/nvme0n1p6
+  cached-lv2: /dev/nvme0n1p7
+  noncached-lv0: /dev/nvme0n1p8
+  noncached-lv1: /dev/nvme0n1p9
+  noncached-lv2: /dev/nvme0n1p10
+NOTE: each of the lvm_volumes logvol names must be unique
+```
+
+=========================================================================================
+
 ```
 buildLVM.sh
 -----------------------
