@@ -3,6 +3,7 @@ scripts to prepare LVM logical volumes and device partitions for use in ceph-vol
   * buildLVM.sh   <-- builds the configuration
   * destroyLVM.sh <-- teardown the configuration
   
+```
 buildLVM.sh
 -----------------------
 AFTER RUNNING lsblk output resembles:
@@ -35,4 +36,4 @@ AFTER RUNNING lvs output resembles:
  noncached-lv0 noncached-vg0 -wi-a----- 100.00g     
  noncached-lv1 noncached-vg1 -wi-a----- 100.00g     
  noncached-lv2 noncached-vg2 -wi-a----- 100.00g  
-
+```
