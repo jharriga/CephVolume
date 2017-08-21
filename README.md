@@ -3,6 +3,7 @@ scripts to prepare LVM logical volumes and device partitions for use in ceph-vol
   * buildLVM.sh   <-- builds the configuration
   * destroyLVM.sh <-- teardown the configuration
 
+Prepares logvols and NVME partitions to match this OSD node specification: 
 ```
 Section from /usr/share/ceph-ansible/group_vars/osds
 osd_scenario: lvm
