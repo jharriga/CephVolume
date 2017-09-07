@@ -1,3 +1,4 @@
+#!/bin/sh
 #-------------------------------------
 # destroyLVM.sh
 # Tears-down the NONcached and LVMcached lvm configurations
