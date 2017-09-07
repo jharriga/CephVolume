@@ -1,4 +1,4 @@
-#
+#!/bin/sh
 # buildLVM.sh
 #-----------------------
 # AFTER RUNNING lsblk output resembles:
