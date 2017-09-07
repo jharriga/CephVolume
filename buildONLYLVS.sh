@@ -1,4 +1,4 @@
-#
+#!/bin/sh
 # buildONLYLVS.sh
 #-----------------------
 # AFTER RUNNING lsblk output resembles:
