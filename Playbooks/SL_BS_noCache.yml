@@ -1,0 +1,204 @@
+---
+
+# ansible script to prepare OSD devices for osd_scenario=lvm
+# using Bluestore
+#
+# NEEDS TASKS Added to create VGs and LVs for 'rocksdb' and 'wal'
+#
+# Partitions two 800GB NVMe and 24 1.8TB HDD devices and then
+# creates logical vols
+# LVM logical volume will be named /dev/vg-ceph-$dev/lv-ceph-$dev
+# where $dev is the hdd device name
+
+- name: prepare for use of osd_scenario=lvm. Create partitions & logvols
+  hosts:
+  - osds
+
+  vars:
+# for when you only want to do teardown
+  - teardown: 1
+#
+  # units for partition and LV sizes should be in MB
+  - datadev_size: 1800000
+  - nvmedev_size: 800000
+  # assumption: only one partition per slow device
+  # we wouldn't even use a partition to pvcreate 
+  # except that LVM seems to require it now
+# list the FAST DEVICES - must all be the same size
+  - nvmedev1: /dev/nvme0n1
+  - nvmedev2: /dev/nvme1n1
+
+  # for device names ending in a digit, partitions have a prefix "p", 
+  # for device names ending in a letter  they do not
+  - partprefix: p
+  # sizes are in MB - (11776+5888) * 24 = 423936MB
+  - rocksdb_lv_size: 10240      # default is 1024MB
+  - rocksdb_part_size: 11776    # lv_size + 15%
+  - wal_lv_size: 5120          # default is 512MB
+  - wal_part_size: 5888        # lv_size + 15%
+# Which HDDs are cached on which of the FASTdevs - must be equal #
+# Scale Lab 6048r have 36 total hard disk drives, using 24 of them
+# so twelve per NVME device
+  - datadev1_hdds:
+    - /dev/sdc
+    - /dev/sdd
+    - /dev/sde
+    - /dev/sdf
+    - /dev/sdg
+    - /dev/sdh
+    - /dev/sdi
+    - /dev/sdj
+    - /dev/sdk
+    - /dev/sdl
+    - /dev/sdm
+    - /dev/sdn
+  - datadev2_hdds:
+    - /dev/sdu
+    - /dev/sdv
+    - /dev/sdw
+    - /dev/sdx
+    - /dev/sdy
+    - /dev/sdz
+    - /dev/sdaa
+    - /dev/sdab
+    - /dev/sdac
+    - /dev/sdad
+    - /dev/sdae
+    - /dev/sdaf
+
+  tasks:
+  - name: identify partitions to use for nvme devices (NVMEdev1)
+    shell: "for n in `seq 1 {{datadev1_hdds|length}}` ; do echo {{nvmedev1}}{{partprefix}}$n ; done"
+    register: nvmedev1_parts
+
+  - name: check that lists are the same length (NVMEdev1)
+    shell: "echo {{nvmedev1_parts.stdout_lines}} {{datadev1_hdds}}"
+    failed_when: "{{nvmedev1_parts.stdout_lines|length}} != {{datadev1_hdds|length}}"
+
+  - name: identify partitions to use for nvme devices (NVMEdev2)
+    shell: "for n in `seq 1 {{datadev2_hdds|length}}` ; do echo {{nvmedev2}}{{partprefix}}$n ; done"
+    register: nvmedev2_parts
+
+  - name: check that lists are the same length (NVMEdev2)
+    shell: "echo {{nvmedev2_parts.stdout_lines}} {{datadev2_hdds}}"
+    failed_when: "{{nvmedev2_parts.stdout_lines|length}} != {{datadev2_hdds|length}}"
+
+  - name: find old OSD filesystems
+    shell: "grep /var/lib/ceph/osd /proc/mounts | awk '{print $2}'"
+    register: old_osd_filesystems
+
+  - name: tear down old OSD filesystems
+    shell: "umount -v {{item}}"
+    with_items: "{{old_osd_filesystems.stdout_lines}}"
+
+  - name: kill all LVM commands that may have been hung
+    shell: "killall -q lvcreate pvcreate vgcreate lvconvert || echo -n"
+    failed_when: false
+
+  - name: identify ceph VGs
+    shell: "vgscan | grep vg-ceph | awk '/Found/ { print $4 }' | tr '\"' ' '"
+    register: old_ceph_vgs
+
+  - name: identify ceph LVs
+    shell: "lvscan | grep lv-ceph | awk '/ACTIVE/ { print $2 }' | tr -d \"'\""
+    register: old_ceph_lvs
+
+  - name: tear down LVM logical volumes
+    shell: "echo y | lvremove -f {{item}}"
+    with_items: "{{old_ceph_lvs.stdout_lines}}"
+
+  - name: tear down VG
+    shell: "vgremove -f {{item}}"
+    with_items: "{{old_ceph_vgs.stdout_lines}}"
+
+  - name: tear down hdd PV
+    shell: "pvdisplay {{item}}1 ; if [ $? == 0 ] ; then  pvremove {{item}}1 ; fi "
+    with_items: 
+      - "{{datadev1_hdds}}"
+      - "{{datadev2_hdds}}"
+
+  - name: tear down nvme PV
+    shell: "pvdisplay {{item}} ; if [ $? == 0 ] ; then  pvremove {{item}} ; fi "
+    with_items: 
+      - "{{nvmedev1_parts.stdout_lines}}"
+      - "{{nvmedev2_parts.stdout_lines}}"
+
+  - name: wait a sec
+    shell: sleep 1
+
+  - name: tear down datadev partitions
+    shell: "if [ -e {{item}}1 ] ; then parted -s {{item}} rm 1 ; fi"
+    with_items: 
+      - "{{datadev1_hdds}}"
+      - "{{datadev2_hdds}}"
+    
+  - name: tear down nvme partitions (NVMEdev1)
+    shell: "if [ -e {{item}} ] ; then parted -s {{nvmedev1}} rm `echo {{item}} | sed s,{{nvmedev1}}{{partprefix}},,` ; fi"
+    with_items: "{{nvmedev1_parts.stdout_lines}}"
+
+  - name: tear down nvme partitions (NVMEdev2)
+    shell: "if [ -e {{item}} ] ; then parted -s {{nvmedev2}} rm `echo {{item}} | sed s,{{nvmedev2}}{{partprefix}},,` ; fi"
+    with_items: "{{nvmedev2_parts.stdout_lines}}"
+      
+  - name: make nvme device partition table
+    shell: "parted -s {{item}} mktable gpt && partprobe {{item}}"
+    with_items:
+      - "{{nvmedev1}}"
+      - "{{nvmedev2}}"
+
+  - name: exit
+    shell: exit 1
+    when: teardown is defined
+# TEARDOWN TASKS COMPLETE
+
+  #- name: remove any LVM locks for ceph
+  #  shell: "rm -fv /run/lock/lvm/V_vg_ceph_osds*"
+
+  - name: create Ceph data partitions
+    shell: "parted -a optimal -s {{item}} mkpart primary 1m {{datadev_size}}M"
+    with_items: 
+      - "{{datadev1_hdds}}"
+      - "{{datadev2_hdds}}"
+
+  - name: create Ceph nvme partitions (NVMEdev1)
+    script: "mkpart.sh {{nvmedev1}} {{datadev1_hdds|length}} {{rocksdb_part_size}} {{wal_part_size}}"
+
+  - name: create Ceph nvme partitions (NVMEdev2)
+    script: "mkpart.sh {{nvmedev2}} {{datadev2_hdds|length}} {{rocksdb_part_size}} {{wal_part_size}}"
+
+  - name: add Ceph data device as LVM PV
+    shell: "sleep 1 ; pvcreate -ff {{item}}1"
+    with_items:
+     - "{{datadev1_hdds}}"
+     - "{{datadev2_hdds}}"
+
+  - name: add nvme partition as LVM PV
+    shell: "sleep 1 ; pvcreate -ff {{item}}"
+    with_items: 
+      - "{{nvmedev1_parts.stdout_lines}}"
+      - "{{nvmedev2_parts.stdout_lines}}"
+
+  - name: create Ceph data VGs
+    shell: "sleep 1 ; vgcreate vg-cephdata-`basename {{item}}` {{item}}1"
+    with_items: 
+      - "{{datadev1_hdds}}"
+      - "{{datadev2_hdds}}"
+
+  - name: create Ceph data LVs
+    shell: "(( datalv_size={{datadev_size}} - 90000 )) ; echo y | lvcreate --name lv-cephdata-`basename {{item}}` --size ${datalv_size}M vg-cephdata-`basename {{item}}` {{item}}1"
+    with_items: 
+      - "{{datadev1_hdds}}"
+      - "{{datadev2_hdds}}"
+
+  - name: create rocksdb, wal LVs (NVMEdev1)
+    shell: "vgnm=vg-cephdb_wal-`basename {{item.0}}` ; (echo y | lvcreate --name rocksdb --size {{rocksdb_lv_size}}M $vgnm {{item.1}}) && (echo y | lvcreate --name wal --size {{wal_lv_size}}M $vgnm {{item.1}})"
+    with_together:
+    - "{{datadev1_hdds}}"
+    - "{{nvmedev1_parts.stdout_lines}}"
+
+  - name: create rocksdb, wal LVs (NVMEdev2)
+    shell: "vgnm=vg-cephdb_wal-`basename {{item.0}}` ; (echo y | lvcreate --name rocksdb --size {{rocksdb_lv_size}}M $vgnm {{item.1}}) && (echo y | lvcreate --name wal --size {{wal_lv_size}}M $vgnm {{item.1}})"
+    with_together:
+    - "{{datadev2_hdds}}"
+    - "{{nvmedev2_parts.stdout_lines}}"
+
