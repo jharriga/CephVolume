@@ -1,31 +1,246 @@
-#!/bin/bash -x
-# input units are MB
-dev=$1
-parts=$2
-lvmpv_sz=$3
-ceph_journal_sz=$4
-if [ -z "$ceph_journal_sz" ] ; then exit 1 ; fi 
-partprobe $dev
+---
 
-delay()
-{
-  echo 'import time; time.sleep(0.2)' | python
-}
+# ansible script to prepare OSD devices for osd_scenario=lvm
+# Partitions NVMe and HDD devices and then creates log vols
+# LVM logical volume will be named /dev/vg-ceph-$dev/lv-ceph-$dev
+# where $dev is the hdd device name
 
-b=1
-for p in `seq 1 $parts` ; do 
-  (( e = $b + $lvmpv_sz )) 
-  delay
-  (parted -s -a optimal $dev mkpart logical ${b}M ${e}M && \
-   parted -s $dev name $p lvm_pv_$p) || exit 1
-  (( b = $b + $lvmpv_sz ))
-done
-for p in `seq 1 $parts` ; do
-  (( partnum = $p + $parts ))
-  (( e = $b + $ceph_journal_sz ))
-  delay
-  (parted -s -a optimal $dev mkpart logical ${b}M ${e}M && \
-   parted -s $dev name $partnum ceph_journal_$p) || exit 1
-  (( b = $b + $ceph_journal_sz ))
-done
-partprobe $dev
+- name: prepare for use of osd_scenario=lvm. Create partitions & logvols
+  hosts:
+  - osds
+
+  vars:
+# for when you only want to do teardown
+#  - teardown: 1
+#
+  # units for partition and LV sizes should be in MB
+  - slowdev_size: 990000
+  - fastdev_size: 800000
+  # assumption: only one partition per slow device
+  # we wouldn't even use a partition to pvcreate 
+  # except that LVM seems to require it now
+# list the FAST DEVICES - must all be the same size
+  - fastdev1: /dev/nvme0n1
+  - fastdev2: /dev/nvme1n1
+
+  # for device names ending in a digit, partitions have a prefix "p", 
+  # for device names ending in a letter  they do not
+  - partprefix: p
+  # sizes are in MB
+#  - ssd_journal_size:3000
+  - ssd_journal_size: 5850          # roundup to allow 5120 ceph osd journal
+#  - fs_journal_size: 1000
+  - fs_journal_size: 0
+  - metalv_size: 1000
+  # LVMcache cache mode
+#  - cache_mode: writeback
+  - cache_mode: writethrough
+# Which HDDs are cached on which of the FASTdevs - must be equal #
+# Scale Lab 6048r have 36 total hard disk drives
+  - fastdev1_hdds:
+    - /dev/sdc
+    - /dev/sdd
+    - /dev/sde
+    - /dev/sdf
+    - /dev/sdg
+    - /dev/sdh
+    - /dev/sdi
+    - /dev/sdj
+    - /dev/sdk
+    - /dev/sdl
+    - /dev/sdm
+    - /dev/sdn
+    - /dev/sdo
+    - /dev/sdp
+    - /dev/sdq
+    - /dev/sdr
+    - /dev/sds
+    - /dev/sdt
+  - fastdev2_hdds:
+    - /dev/sdu
+    - /dev/sdv
+    - /dev/sdw
+    - /dev/sdx
+    - /dev/sdy
+    - /dev/sdz
+    - /dev/sdaa
+    - /dev/sdab
+    - /dev/sdac
+    - /dev/sdad
+    - /dev/sdae
+    - /dev/sdaf
+    - /dev/sdag
+    - /dev/sdah
+    - /dev/sdai
+    - /dev/sdaj
+    - /dev/sdak
+    - /dev/sdal
+
+  tasks:
+  - name: calculate partition and LV sizes
+    local_action: "shell python calc_part_sizes.py {{fastdev_size}} {{fastdev1_hdds|length}} {{ssd_journal_size}} {{fs_journal_size}} {{metalv_size}}"
+    register: part_sizes
+
+  - set_fact: >
+      total_per_osd_fast_size={{part_sizes.stdout_lines[0]}}
+      fastlv_size={{part_sizes.stdout_lines[1]}}
+
+  - name: identify partitions to use for fast devices (FASTdev1)
+    shell: "for n in `seq 1 {{fastdev1_hdds|length}}` ; do echo {{fastdev1}}{{partprefix}}$n ; done"
+    register: fastdev1_parts
+
+  - name: check that lists are the same length (FASTdev1)
+    shell: "echo {{fastdev1_parts.stdout_lines}} {{fastdev1_hdds}}"
+    failed_when: "{{fastdev1_parts.stdout_lines|length}} != {{fastdev1_hdds|length}}"
+
+  - name: identify partitions to use for fast devices (FASTdev2)
+    shell: "for n in `seq 1 {{fastdev2_hdds|length}}` ; do echo {{fastdev2}}{{partprefix}}$n ; done"
+    register: fastdev2_parts
+
+  - name: check that lists are the same length (FASTdev2)
+    shell: "echo {{fastdev2_parts.stdout_lines}} {{fastdev2_hdds}}"
+    failed_when: "{{fastdev2_parts.stdout_lines|length}} != {{fastdev2_hdds|length}}"
+
+  - name: find old OSD filesystems
+    shell: "grep /var/lib/ceph/osd /proc/mounts | awk '{print $2}'"
+    register: old_osd_filesystems
+
+  - name: tear down old OSD filesystems
+    shell: "umount -v {{item}}"
+    with_items: "{{old_osd_filesystems.stdout_lines}}"
+
+  - name: kill all LVM commands that may have been hung
+    shell: "killall -q lvcreate pvcreate vgcreate lvconvert || echo -n"
+    failed_when: false
+
+  - name: identify ceph VGs
+    shell: "vgscan | grep vg-ceph | awk '/Found/ { print $4 }' | tr '\"' ' '"
+    register: old_ceph_vgs
+
+  - name: identify ceph LVs
+    shell: "lvscan | grep lv-ceph | awk '/ACTIVE/ { print $2 }' | tr -d \"'\""
+    register: old_ceph_lvs
+
+  - name: tear down LVM logical volumes
+    shell: "echo y | lvremove -f {{item}}"
+    with_items: "{{old_ceph_lvs.stdout_lines}}"
+
+  - name: tear down VG
+    shell: "vgremove -f {{item}}"
+    with_items: "{{old_ceph_vgs.stdout_lines}}"
+
+  - name: tear down slow PV
+    shell: "pvdisplay {{item}}1 ; if [ $? == 0 ] ; then  pvremove {{item}}1 ; fi "
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+
+  - name: tear down fast PV
+    shell: "pvdisplay {{item}} ; if [ $? == 0 ] ; then  pvremove {{item}} ; fi "
+    with_items: 
+      - "{{fastdev1_parts.stdout_lines}}"
+      - "{{fastdev2_parts.stdout_lines}}"
+
+  - name: wait a sec
+    shell: sleep 1
+
+  - name: tear down slow partitions
+    shell: "if [ -e {{item}}1 ] ; then parted -s {{item}} rm 1 ; fi"
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+    
+  - name: tear down fast partitions (FASTdev1)
+    shell: "if [ -e {{item}} ] ; then parted -s {{fastdev1}} rm `echo {{item}} | sed s,{{fastdev1}}{{partprefix}},,` ; fi"
+    with_items: "{{fastdev1_parts.stdout_lines}}"
+
+  - name: tear down fast partitions (FASTdev2)
+    shell: "if [ -e {{item}} ] ; then parted -s {{fastdev2}} rm `echo {{item}} | sed s,{{fastdev2}}{{partprefix}},,` ; fi"
+    with_items: "{{fastdev2_parts.stdout_lines}}"
+      
+  - name: make fast device partition table
+    shell: "parted -s {{item}} mktable gpt && partprobe {{item}}"
+    with_items:
+      - "{{fastdev1}}"
+      - "{{fastdev2}}"
+
+  - name: exit
+    shell: exit 1
+    when: teardown is defined
+# TEARDOWN TASKS COMPLETE
+
+  #- name: remove any LVM locks for ceph
+  #  shell: "rm -fv /run/lock/lvm/V_vg_ceph_osds*"
+
+  - name: create slow partitions
+    shell: "parted -a optimal -s {{item}} mkpart primary 1m {{slowdev_size}}M"
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+
+  - name: create fast partitions (FASTdev1)
+    script: "mkpart.sh {{fastdev1}} {{fastdev1_hdds|length}} {{total_per_osd_fast_size}} {{ssd_journal_size}}"
+
+  - name: create fast partitions (FASTdev2)
+    script: "mkpart.sh {{fastdev2}} {{fastdev2_hdds|length}} {{total_per_osd_fast_size}} {{ssd_journal_size}}"
+
+  - name: add slow device as LVM PV
+    shell: "sleep 1 ; pvcreate -ff {{item}}1"
+    with_items:
+     - "{{fastdev1_hdds}}"
+     - "{{fastdev2_hdds}}"
+
+  - name: add fast partition as LVM PV
+    shell: "sleep 1 ; pvcreate -ff {{item}}"
+    with_items: 
+      - "{{fastdev1_parts.stdout_lines}}"
+      - "{{fastdev2_parts.stdout_lines}}"
+
+  - name: create Ceph VG
+    shell: "sleep 1 ; vgcreate vg-ceph-`basename {{item}}` {{item}}1"
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+
+  - name: extend Ceph VG to include fast partition (FASTdev1)
+    shell: "sleep 1 ; vgextend vg-ceph-`basename {{item.0}}` {{item.1}}"
+    with_together:
+    - "{{fastdev1_hdds}}"
+    - "{{fastdev1_parts.stdout_lines}}"
+
+  - name: extend Ceph VG to include fast partition (FASTdev2)
+    shell: "sleep 1 ; vgextend vg-ceph-`basename {{item.0}}` {{item.1}}"
+    with_together:
+    - "{{fastdev2_hdds}}"
+    - "{{fastdev2_parts.stdout_lines}}"
+
+  - name: create slow LV
+    shell: "(( slowlv_size={{slowdev_size}} - 50000 )) ; echo y | lvcreate --name lv-ceph-`basename {{item}}` --size ${slowlv_size}M vg-ceph-`basename {{item}}` {{item}}1"
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+
+# JTH edits - no fs_journal
+  - name: create fast, metadata log vols (FASTdev1)
+    shell: "vgnm=vg-ceph-`basename {{item.0}}` ; (echo y | lvcreate --name metadata --size {{metalv_size}}M $vgnm {{item.1}}) && (echo y | lvcreate --name fast --size {{fastlv_size}}M $vgnm {{item.1}})"
+    with_together:
+    - "{{fastdev1_hdds}}"
+    - "{{fastdev1_parts.stdout_lines}}"
+
+  - name: create fast, metadata log vols (FASTdev2)
+    shell: "vgnm=vg-ceph-`basename {{item.0}}` ; (echo y | lvcreate --name metadata --size {{metalv_size}}M $vgnm {{item.1}}) && (echo y | lvcreate --name fast --size {{fastlv_size}}M $vgnm {{item.1}})"
+    with_together:
+    - "{{fastdev2_hdds}}"
+    - "{{fastdev2_parts.stdout_lines}}"
+
+  - name: create a cache pool
+    shell: "vgnm=vg-ceph-`basename {{item}}` ; echo y | lvconvert --type cache-pool --poolmetadata $vgnm/metadata $vgnm/fast"
+    with_items: 
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
+
+  - name: create LVM cache volume
+    shell: "vgnm=vg-ceph-`basename {{item}}` ; echo y | lvconvert --type cache --cachepool $vgnm/fast --cachemode {{cache_mode}} $vgnm/lv-ceph-`basename {{item}}`"
+    with_items:
+      - "{{fastdev1_hdds}}"
+      - "{{fastdev2_hdds}}"
